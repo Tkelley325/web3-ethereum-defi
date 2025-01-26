@@ -9,6 +9,7 @@
 import logging
 import secrets
 from decimal import Decimal
+from pprint import pformat
 from typing import Optional, NamedTuple
 
 from eth_account import Account
@@ -20,7 +21,7 @@ from web3 import Web3
 from web3._utils.contracts import prepare_transaction
 from web3.contract.contract import ContractFunction
 
-from eth_defi.gas import estimate_gas_fees, apply_gas
+from eth_defi.gas import estimate_gas_fees, apply_gas, estimate_gas_price
 from eth_defi.tx import decode_signed_transaction
 
 
@@ -110,6 +111,17 @@ class HotWallet:
     See also :py:func:`eth_defi.middleware.construct_sign_and_send_raw_middleware_anvil`
     when working with Anvil.
 
+
+    Example sending USDC with ``HotWallet`` class:
+
+    .. code-block:: python
+
+        from eth_defi.token import fetch_erc20_details
+        usdc = fetch_erc20_details(web3, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")  # Ethereum mainnet
+        bound_call = usdc.transfer("<to address here>", Decimal(2140))
+        tx_hash = hot_wallet.transact_and_broadcast_with_contract(bound_call)
+        print("Broadcasted:", tx_hash.hex())
+
     Example:
 
     .. code-block:: python
@@ -170,6 +182,9 @@ class HotWallet:
         """The private key as plain text."""
         return self.account._private_key
 
+    def get_main_address(self) -> HexAddress:
+        return self.address
+
     def sync_nonce(self, web3: Web3):
         """Initialise the current nonce from the on-chain data."""
         self.current_nonce = web3.eth.get_transaction_count(self.account.address)
@@ -182,7 +197,7 @@ class HotWallet:
 
         Increase the nonce counter
         """
-        assert self.current_nonce is not None, "Nonce is not yet synced from the blockchain"
+        assert self.current_nonce is not None, f"Nonce is not yet synced from the blockchain: {self}"
         nonce = self.current_nonce
         self.current_nonce += 1
         return nonce
@@ -239,6 +254,8 @@ class HotWallet:
         self,
         func: ContractFunction,
         tx_params: dict | None = None,
+        web3: Web3 | None=None,
+        fill_gas_price=False,
     ) -> SignedTransactionWithNonce:
         """Signs a bound Web3 Contract call.
 
@@ -259,6 +276,18 @@ class HotWallet:
             tx_gas_parameters = apply_gas({"gas": 100_000}, gas_estimation)  # approve should not take more than 100k gas
             signed_tx = hot_wallet.sign_bound_call_with_new_nonce(approve_call, tx_gas_parameters)
 
+        Another example that fills in gas price automatically (but not gas limit):
+
+        .. code-block:: python
+
+            bound_func = vault.settle_via_trading_strategy_module()
+            signed_tx_2 = self.hot_wallet.sign_bound_call_with_new_nonce(
+                bound_func,
+                tx_params={"gas": DEFAULT_LAGOON_SETTLE_GAS},
+                web3=web3,
+                fill_gas_price=True
+            )
+
         See also
 
         - :py:meth:`sign_transaction_with_new_nonce`
@@ -268,6 +297,15 @@ class HotWallet:
 
         :param tx_params:
             Transaction parameters like `gas`
+
+        :param web3:
+            Needed for gas price estimation
+
+        :param fill_gas_price:
+            Fill the gas price automatically.
+
+        :return:
+            A signed transaction with debugging details like used nonce.
         """
         assert isinstance(func, ContractFunction)
 
@@ -280,6 +318,11 @@ class HotWallet:
 
         if "chainId" not in tx_params:
             tx_params["chainId"] = func.w3.eth.chain_id
+
+        if fill_gas_price:
+            assert web3, f"web3 instance must be given for automatic gas price fill"
+            gas_price_suggestion = estimate_gas_price(web3)
+            apply_gas(tx_params, gas_price_suggestion)
 
         if original_tx_params is None:
             # Use the default gas filler
@@ -307,6 +350,104 @@ class HotWallet:
         balance = web3.eth.get_balance(self.address)
         return web3.from_wei(balance, "ether")
 
+    def transact_with_contract(
+        self,
+        func: ContractFunction,
+        *args,
+        **kwargs,
+    ) -> SignedTransactionWithNonce:
+        """Call a contract function.
+
+        - Construct a tx payload ready for `web3.eth.send_raw_transaction`,
+          signed using this hot wallet's private key
+
+        - Remember to call :py:meth:`sync_nonce` before calling this method.
+
+        Example:
+
+        .. code-block:: python
+
+            # Approve USDC deposit to a vault contract
+            deposit_amount = 500 * 10 ** 6
+            signed_tx = hot_wallet_user.transact_with_contract(
+                usdc.contract.functions.approve,
+                Web3.to_checksum_address(vault.rebalance_address),
+                deposit_amount
+            )
+            tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            assert_transaction_success_with_explanation(web3, tx_hash)
+        """
+        assert isinstance(func, ContractFunction), f"Got: {type(func)}"
+        assert func.address is not None, f"ContractFunction is not bound to a contract instance: {func}"
+        web3 = func.w3
+        assert web3 is not None, "ContractFunction not bound to web3 instance"
+
+        tx_data = func(*args, **kwargs).build_transaction({
+            "from": self.address,
+        })
+
+        self.fill_in_gas_price(web3, tx_data)
+        return self.sign_transaction_with_new_nonce(tx_data)
+
+    def transact_and_broadcast_with_contract(
+        self,
+        func: ContractFunction,
+        gas_limit: int=None,
+    ) -> HexBytes:
+        """Transacts with a contract, broadcasts transaction.
+
+        - Shorthand method
+        - Build a contract function call transaction and signs it
+        - Always use a correct manually managed nonce
+
+        Example sending USDC:
+
+        .. code-block:: python
+
+            from eth_defi.token import fetch_erc20_details
+            usdc = fetch_erc20_details(web3, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")  # Ethereum mainnet
+            bound_call = usdc.transfer("<to address here>", Decimal(2140))
+            tx_hash = hot_wallet.transact_and_broadcast_with_contract(bound_call)
+            print("Broadcasted:", tx_hash.hex())
+
+        Another example:
+
+        .. code-block:: python
+
+            deployer = HotWallet.from_private_key(os.environ["PRIVATE_KEY"])
+            bound_func = module.functions.whitelistUniswapV3Router(uniswap_v3.swap_router.address, "Allow Uniswap v3")
+            tx_hash = deployer.transact_and_broadcast_with_contract(bound_func)
+
+        :return:
+            Transaction hash
+        """
+        assert isinstance(func, ContractFunction), f"Got: {type(func)}"
+        assert func.args is not None, f"Unbound contract function? {func}"
+        web3 = func.w3
+
+        tx_data = func.build_transaction({
+            "from": self.address,
+        })
+
+        if gas_limit is not None:
+            tx_data["gas"] = gas_limit
+
+        self.fill_in_gas_price(web3, tx_data)
+
+        if "maxFeePerGas" in tx_data and "gasPrice" in tx_data:
+            # We can have only one
+            # https://ethereum.stackexchange.com/questions/121361/web3py-issue-on-avalanche-when-using-maxpriorityfeepergas-and-maxfeepergas
+            del tx_data["gasPrice"]
+
+        try:
+            signed_tx = self.sign_transaction_with_new_nonce(tx_data)
+        except Exception as e:
+            # Probably mismatch between network expected gas parameter format and what we give
+            raise RuntimeError(f"Could not sign:\n{pformat(tx_data)}") from e
+
+        tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        return tx_hash
+
     @staticmethod
     def fill_in_gas_price(web3: Web3, tx: dict) -> dict:
         """Fills in the gas value fields for a transaction.
@@ -318,6 +459,56 @@ class HotWallet:
         - web3 offers different backends for this
 
         - likely queries the values from the node
+
+        .. note ::
+
+            Mutates ``tx`` in place.
+
+        .. note ::
+
+            Before calling this method, you need to set ``gas`` and ``chainId`` fields of ``tx``.
+
+        Example:
+
+        .. code-block:: python
+
+            private_key = os.environ["PRIVATE_KEY"]
+            # Configure direct-to-sequencer broadcast,
+            # use public Base node for reads
+            rpc_configuration_line = "mev+https://mainnet-sequencer.base.org https://mainnet.base.org"
+            web3 = create_multi_provider_web3(rpc_configuration_line)
+
+            assert web3.eth.chain_id == 8453  # Base
+
+            hot_wallet = HotWallet.from_private_key(private_key)
+            hot_wallet.sync_nonce(web3)
+
+            # As a test transaction, send very small amount of ETH
+            tx_data = {
+                "chainId": web3.eth.chain_id,
+                "from": hot_wallet.address,
+                "to": "0x7612A94AafF7a552C373e3124654C1539a4486A8",  # Random addy
+                "value": Web3.to_wei(Decimal("0.000001"), "ether"),
+                "gas": 50_000,
+            }
+
+            hot_wallet.fill_in_gas_price(web3, tx_data)
+            signed_tx = hot_wallet.sign_transaction_with_new_nonce(tx_data)
+
+            # Blocks until included in a block
+            print("Broadcasting", signed_tx.hash.hex())
+            receipts = wait_and_broadcast_multiple_nodes_mev_blocker(
+                web3.provider,
+                txs=[signed_tx],
+            )
+
+            receipt = receipts[signed_tx.hash]
+            print(f"Transaction broadcasted:\n{pformat(dict(receipt.items()))}")
+
+        :param tx:
+            Transaction data as a dictionary.
+
+            Contains keys like ``to``, ``data``, ``gas``.
 
         :return:
             Transaction data (mutated) with gas values filled in.
@@ -342,12 +533,13 @@ class HotWallet:
         :param key: 0x prefixed hex string
         :return: Ready to go hot wallet account
         """
-        assert key.startswith("0x")
+        assert type(key) == str, f"Expected private key as string, got {type(key)}"
+        assert key.startswith("0x"), f"This system assumes private keys are prefixed with 0x, your key starts with {key[0:8]}... Please add 0x prefix to your private key hex string"
         account = Account.from_key(key)
         return HotWallet(account)
 
     @staticmethod
-    def create_for_testing(web3: Web3, test_account_n=0, eth_amount=10) -> "HotWallet":
+    def create_for_testing(web3: Web3, test_account_n=0, eth_amount=1) -> "HotWallet":
         """Creates a new hot wallet and seeds it with ETH from one of well-known test accounts.
 
         Shortcut method for unit testing.

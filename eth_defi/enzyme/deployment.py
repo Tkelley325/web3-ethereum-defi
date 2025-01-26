@@ -18,8 +18,10 @@ See Enzyme Subgraphs: ---
 
 
 """
+import logging
 import enum
 import re
+import time
 from dataclasses import dataclass, fields
 from typing import Dict, Optional, Tuple
 
@@ -33,6 +35,9 @@ from eth_defi.abi import encode_with_signature, get_deployed_contract
 from eth_defi.deploy import deploy_contract
 from eth_defi.enzyme.utils import ONE_DAY_IN_SECONDS
 from eth_defi.trace import assert_transaction_success_with_explanation
+
+
+logger = logging.getLogger(__name__)
 
 #: Enzyme deployment details for Polygon
 #:
@@ -54,7 +59,28 @@ POLYGON_DEPLOYMENT = {
     "allowed_external_position_types_policy": "0x5A739da3099fd4fC954BD764099Fc000Da76D8e7",
 }
 
-#: Enzyme deployment details for Ehereum
+#: Enzyme deployment details for Arbitrum
+#:
+#: See :py:meth:`EnzymeDeployment.fetch_deployment`
+#:
+#: See https://docs.enzyme.finance/general-info/codebase/contracts/arbitrum
+#:
+ARBITRUM_DEPLOYMENT = {
+    "comptroller_lib": "0x3868c0fc34b6ece124c6ab122f6f29e978be6661",
+    "usdc": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",  # USDC (bridged)
+    "usdt": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",  # USDT
+    "weth": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+    "arb": "0x912ce59144191c1204e64559fe8253a0e49e6548",
+    "fund_value_calculator": "0xea609eeb38d1ee8e8719597d47cc9276df9f8707",
+    "deployed_at": 23_0330_758,  # When comptroller lib was deployed
+    "cumulative_slippage_tolerance_policy": "0x487f6a8a93c2be5a296ead2c3fbc3fceed4ac599",
+    "allowed_adapters_policy": "0x1768b813d17f82a8d70bd8b80a8c8c1562878337",
+    "only_remove_dust_external_position_policy": "0xe4453105be9e579896a3ed73df9a1e285c8c95c2",
+    "only_untrack_dust_or_priceless_assets_policy": "0xa482f4ab637cd5ca00084d511b3ca9aa8d8f475e",
+    "allowed_external_position_types_policy": "0x3c441b696bd451d0ba95ebb73cf1b23c20873e14",
+}
+
+#: Enzyme deployment details for Ethereum
 #:
 #: See :py:meth:`EnzymeDeployment.fetch_deployment`
 #:
@@ -356,6 +382,18 @@ class EnzymeDeployment:
         # Use stack trace supported explanation
         web3 = fund_deployer.w3
         assert_transaction_success_with_explanation(web3, tx_hash)
+
+        # TODO:
+        # Temp hack for Ethereum mainnet.
+        # WTF is going with nodes
+        for i in range(0, 20):
+            try:
+                receipt = web3.eth.get_transaction_receipt(tx_hash)
+            except Exception as e:
+                logger.info("Ethereum mainnet Enzyme deployment workaround %d: %s", i, e)
+                logger.exception(e)
+                time.sleep(i*2)
+                continue
 
         receipt = web3.eth.get_transaction_receipt(tx_hash)
 

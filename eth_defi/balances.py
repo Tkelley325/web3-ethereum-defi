@@ -3,20 +3,25 @@ import logging
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, Optional, Set, Literal
+from typing import Dict, Optional, Collection
 
+import cachetools
 import requests.exceptions
 from eth_typing import BlockNumber, HexAddress
+from multicall import Multicall, Call
 from web3 import Web3
 from web3.contract import Contract
 from web3.exceptions import BadFunctionCallOutput
 from web3.types import BlockIdentifier
 
-from eth_defi.abi import get_contract, get_deployed_contract
+from eth_defi.abi import get_contract
 from eth_defi.event import fetch_all_events
+from eth_defi.provider.anvil import is_anvil, is_mainnet_fork
 from eth_defi.provider.broken_provider import get_almost_latest_block_number
-from eth_defi.token import fetch_erc20_details
-
+from eth_defi.provider.mev_blocker import MEVBlockerProvider
+from eth_defi.provider.named import get_provider_name
+from eth_defi.token import fetch_erc20_details, DEFAULT_TOKEN_CACHE
+from eth_defi.vault.lower_case_dict import LowercaseDict
 
 logger = logging.getLogger(__name__)
 
@@ -112,8 +117,8 @@ def fetch_erc20_balances_by_transfer_event(
 
 def fetch_erc20_balances_by_token_list(
     web3: Web3,
-    owner: HexAddress,
-    tokens: Set[HexAddress | str],
+    owner: HexAddress | str,
+    tokens: Collection[HexAddress | str],
     block_identifier: BlockIdentifier = None,
     decimalise=False,
 ) -> Dict[HexAddress | str, int | Decimal]:
@@ -151,21 +156,32 @@ def fetch_erc20_balances_by_token_list(
         When you give a non-ERC-20 contract as a token.
     """
 
+    assert len(tokens) > 0, "Queried token set is empty"
+
+    assert owner.startswith("0x")
+    owner = Web3.to_checksum_address(owner)
+
     if block_identifier is None:
         block_identifier = get_almost_latest_block_number(web3)
         last_block = web3.eth.block_number
-        logger.info(f"Reading token balances for {len(tokens)} tokens at block {block_identifier}, last block is {last_block}")
+    else:
+        last_block = None
+
+    chain_id = web3.eth.chain_id
+
+    logger.info(f"Reading the latest token balances for {len(tokens)} tokens at block identifier {block_identifier}, last block is {last_block}, address is {owner}")
 
     balances = {}
     for address in tokens:
-        erc_20 = get_deployed_contract(web3, "sushi/IERC20.json", address)
+        # Uses cached token ABI
+        token = fetch_erc20_details(web3, address, chain_id=chain_id)
         try:
-            raw_amount = erc_20.functions.balanceOf(owner).call(block_identifier=block_identifier)
             if decimalise:
-                token = fetch_erc20_details(web3, address)
-                balances[address] = token.convert_to_decimals(raw_amount)
+                balances[address] = token.fetch_balance_of(owner, block_identifier)
             else:
+                raw_amount = token.contract.functions.balanceOf(owner).call(block_identifier=block_identifier)
                 balances[address] = raw_amount
+
         except BadFunctionCallOutput as e:
             raise BalanceFetchFailed(f"Could not get ERC-20 {address} balance for {owner}") from e
 
@@ -214,3 +230,230 @@ def convert_balances_to_decimal(
         res[address] = DecimalisedHolding(Decimal(raw_balance) / Decimal(10**decimals), decimals, contract)
 
     return res
+
+
+def fetch_erc20_balances_multicall(
+    web3: Web3,
+    address: HexAddress | str,
+    tokens: list[HexAddress | str] | set[HexAddress | str],
+    block_identifier,
+    decimalise=True,
+    chunk_size=50,
+    token_cache: cachetools.Cache | None = DEFAULT_TOKEN_CACHE,
+    gas_limit=10_000_000,
+    raise_on_error=True,
+) -> dict[HexAddress | str, Decimal]:
+    """Read balance of multiple ERC-20 tokens on an address once using multicall.
+
+    - Fast, batches multiple calls on one JSON-RPC request
+
+    - Uses `Multicall library <https://github.com/banteg/multicall.py>`__
+
+    Example:
+
+    .. code-block:: python
+
+        def test_fetch_erc20_balances_multicall(web3):
+
+            tokens = {
+                "0x6921B130D297cc43754afba22e5EAc0FBf8Db75b",  # DogInMe
+                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC on Base
+            }
+
+            # Velvet vault
+            address = "0x9d247fbc63e4d50b257be939a264d68758b43d04"
+
+            block_number = get_almost_latest_block_number(web3)
+
+            balances = fetch_erc20_balances_multicall(
+                web3,
+                address,
+                tokens,
+                block_identifier=block_number,
+            )
+
+            existing_dogmein_balance = balances["0x6921B130D297cc43754afba22e5EAc0FBf8Db75b"]
+            assert existing_dogmein_balance > 0
+
+            existing_usdc_balance = balances["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"]
+            assert existing_usdc_balance > Decimal(1.0)
+
+    :param address:
+        Address of which balances we query
+
+    :param tokens:
+        List of ERC-20 addresses.
+
+    :param block_identifier:
+        Fetch at specific height.
+
+        Must be given for a multicall.
+
+    :param chunk_size:
+        How many ERC-20 addresses feed to multicall once
+
+    :param gas_limit:
+        Gas limit of the multicall request
+
+    :param decimalise:
+        If ``True``, convert output amounts to humanised format in Python :py:class:`Decimal`.
+
+         Use cached :py:class:`TokenDetails` data.
+
+    :param token_cache:
+        Cache ERC-20 decimal data.
+
+    :param raise_on_error:
+        See `BalanceFetchFailed`.
+
+    :raise BalanceFetchFailed:
+        balanceOf() call failed.
+
+        When you give a non-ERC-20 contract as a token.
+
+    :return:
+        Map of token address -> balance.
+
+        If ERC-20 call failed, balance is set to `None` if `raise_on_error` is `False`.
+    """
+
+    assert address.startswith("0x")
+    assert block_identifier
+
+    all_calls = {}
+
+    def _handler(success, value):
+        if not success:
+            return None
+        return value
+
+    # TODO: Rewrite this code without using Multicall library
+    # See multicall_batcher.py
+
+    # Handle our special MEV + Fallback (read) providers
+    provider = web3.provider
+    if isinstance(provider, MEVBlockerProvider):
+        logger.info("Skipping MEV RPC provider, using %s for multicall", provider.call_provider)
+        web3 = Web3(provider.call_provider)
+
+    chain_id = web3.eth.chain_id
+
+    rpc_name = get_provider_name(web3.provider)
+
+    logger.info(
+        "Looking up token balances for %d addresses, chunk size %d, gas limit %d, using provider %s",
+        len(tokens),
+        chunk_size,
+        gas_limit,
+        rpc_name,
+    )
+
+    tokens = list(tokens)
+
+    for i in range(0, len(tokens), chunk_size):
+
+        token_address_chunk = tokens[i:i + chunk_size]
+
+        # Build the batch of calls for
+        calls =[
+            Call(token_addr, ['balanceOf(address)(uint256)', address], [(token_addr, _handler)])
+            for token_addr in token_address_chunk
+        ]
+
+        multicall = Multicall(
+            calls=calls,
+            block_id=block_identifier,
+            _w3=web3,
+            require_success=False,
+            gas_limit=gas_limit,
+        )
+
+        batched_result = multicall()
+        all_calls.update(batched_result)
+
+    if raise_on_error:
+        for token_address, raw_balance in all_calls.items():
+            if raw_balance is None:
+                raise BalanceFetchFailed(f"Could not read token balance for ERC-20: {token_address} for address {address}")
+
+    if decimalise:
+        result = LowercaseDict()
+        for token_address, raw_balance in all_calls.items():
+            token = fetch_erc20_details(web3, token_address, cache=token_cache, chain_id=chain_id)
+            result[token_address] = token.convert_to_decimals(raw_balance) if raw_balance is not None else None
+    else:
+        result = all_calls
+
+    return result
+
+
+def fetch_erc20_balances_fallback(
+    web3: Web3,
+    address: HexAddress | str,
+    tokens: list[HexAddress | str] | set[HexAddress | str],
+    block_identifier: BlockIdentifier,
+    decimalise=True,
+    chunk_size=50,
+    token_cache: cachetools.Cache | None = DEFAULT_TOKEN_CACHE,
+    gas_limit=10_000_000,
+    raise_on_error=True,
+    disable_multicall: bool=None,
+) -> dict[HexAddress | str, Decimal]:
+    """Get all onchain balances of the token.
+
+    - Safe variant
+
+    - Try multicall approach first
+
+    - If it fails for some reason, fall to individual JSON-RPC API approach
+
+    - A reason for the failure would be crappy RPC providers
+
+    See :py:func:`fetch_erc20_balances_multicall` for usage and argument descriptions.
+
+    :param disable_multicall:
+        Disable multicall behaviour.
+
+        If set to `None` autodetect local dev/test chain and disable based on the presence of Anvil:
+        assume no multicall contract deployed there. On the mainnet fork, assume the presence of multicall contract.
+    """
+
+    # Multicall not deployed on local test chains
+    if disable_multicall is None:
+        disable_multicall = is_anvil(web3) and not is_mainnet_fork(web3)
+
+    if disable_multicall:
+        balances = fetch_erc20_balances_by_token_list(
+            web3,
+            address,
+            tokens,
+            block_identifier=block_identifier,
+            decimalise=True,
+        )
+    else:
+        try:
+            balances = fetch_erc20_balances_multicall(
+                web3,
+                address,
+                tokens,
+                block_identifier=block_identifier,
+                decimalise=decimalise,
+                chunk_size=chunk_size,
+                token_cache=token_cache,
+                gas_limit=gas_limit,
+                raise_on_error=raise_on_error,
+            )
+        except Exception as e:
+            # RPC failure - multicall error cannot be handled gracefully.
+            # Try something better.
+            # https://github.com/banteg/multicall.py/issues/103
+            logger.error("fetch_erc20_balances_multicall() failed with %s, falling back to single call processing of balance fetches", e, exc_info=e)
+            balances = fetch_erc20_balances_by_token_list(
+                web3,
+                address,
+                tokens,
+                block_identifier=block_identifier,
+                decimalise=decimalise,
+            )
+
+    return balances

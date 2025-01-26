@@ -30,6 +30,7 @@ from web3.types import TxParams, TxReceipt
 
 from eth_defi.abi import decode_function_args, humanise_decoded_arg_data
 from eth_defi.deploy import ContractRegistry, get_or_create_contract_registry
+from eth_defi.provider.anvil import is_anvil
 from eth_defi.revert_reason import fetch_transaction_revert_reason
 
 logger = logging.getLogger(__name__)
@@ -246,7 +247,7 @@ def print_symbolic_trace(
 
 def assert_transaction_success_with_explanation(
     web3: Web3,
-    tx_hash: HexBytes,
+    tx_hash: HexBytes | str,
     RaisedException=TransactionAssertionError,
     tracing: bool = False,
 ) -> TxReceipt:
@@ -279,6 +280,11 @@ def assert_transaction_success_with_explanation(
 
     See also :py:func:`print_symbolic_trace`.
 
+
+    .. note::
+
+        TODO: Currently does not work with failed contract deployment transactions.
+
     :param web3:
         Web3 instance
 
@@ -300,23 +306,29 @@ def assert_transaction_success_with_explanation(
         Output transaction receipt if no error is raised
     """
 
+    if type(tx_hash) == str:
+        tx_hash = HexBytes(tx_hash)
+
     receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
     if receipt["status"] == 0:
         # Explain why the transaction failed
         tx_details = web3.eth.get_transaction(tx_hash)
 
-        if web3.eth.chain_id == 31337 or tracing:
+        on_anvil = is_anvil(web3)
+
+        revert_reason = fetch_transaction_revert_reason(web3, tx_hash)
+
+        if on_anvil or tracing:
             # Transaction tracing only enabled to anvil
-            revert_reason = fetch_transaction_revert_reason(web3, tx_hash)
             trace_data = trace_evm_transaction(web3, tx_hash, TraceMethod.parity)
             trace_output = print_symbolic_trace(get_or_create_contract_registry(web3), trace_data)
             raise RaisedException(
-                f"Transaction failed: {tx_details}\n" f"Revert reason: {revert_reason}\n" f"Solidity stack trace:\n" f"{trace_output}\n",
+                f"Revert reason: {revert_reason}\nSolidity stack trace:\n{trace_output}\nTransaction details:\n{tx_details}\nTransaction receipt:{receipt}",
                 revert_reason=revert_reason,
                 solidity_stack_trace=trace_output,
             )
         else:
-            raise RaisedException(f"Transaction failed: {tx_details} - tracing disabled")
+            raise RaisedException(f"Transaction {tx_hash.hex()} failed: {revert_reason}\nDetails\n{tx_details}\nTracing disabled")
 
     return receipt
 

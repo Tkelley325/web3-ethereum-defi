@@ -127,6 +127,10 @@ DEFAULT_RETRYABLE_RPC_ERROR_CODES = (
     # Some JSON-RPC provider is buying nodes from allondes.com have have screwed it up
     # ValueError: {'code': -32701, 'message': 'Please specify address in your request or, to remove restrictions, order a dedicated full node here: https://www.allnodes.com/bnb/host'}
     -32701,
+
+    # dRPC failure
+    # ValueError: {'message': 'There are not enough CUPs left to cover the CU required for current request.', 'code': 42903}g
+    42903,
 )
 
 
@@ -223,6 +227,12 @@ def is_retryable_http_exception(
 
                 if message in retryable_rpc_error_messages:
                     return True
+
+                for string_check in retryable_rpc_error_messages:
+                    if string_check in message:
+                        # Some RPCs add their own crap to the error messages, so exact error
+                        # message matching does not seem to work
+                        return True
 
                 return False
 

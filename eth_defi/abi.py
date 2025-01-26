@@ -11,7 +11,7 @@ import json
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Sequence, Type, Union
+from typing import Optional, Sequence, Type, Union, Any
 
 import eth_abi
 from eth_abi import decode
@@ -27,10 +27,18 @@ from web3.contract.contract import Contract, ContractFunction
 # Cache loaded ABI files in-process memory for speedup
 from web3.datastructures import AttributeDict
 
-from eth_defi.utils import ZERO_ADDRESS_STR
-
 # How big are our ABI and contract caches
 _CACHE_SIZE = 512
+
+
+#: Ethereum 0x0000000000000000000000000000000000000000 address as a string.
+#:
+#: Legacy. Use one below.
+#:
+ZERO_ADDRESS_STR = "0x0000000000000000000000000000000000000000"
+
+#: Ethereum 0x0000000000000000000000000000000000000000 address
+ZERO_ADDRESS = ZERO_ADDRESS_STR
 
 
 @lru_cache(maxsize=_CACHE_SIZE)
@@ -193,6 +201,7 @@ def get_deployed_contract(
     :return:
         `web3.contract.Contract` proxy
     """
+    assert isinstance(web3, Web3), f"Got {type(web3)} instead of Web3"
     assert address, f"get_deployed_contract() address was None"
 
     address = Web3.to_checksum_address(address)
@@ -288,6 +297,34 @@ def encode_function_args(func: ContractFunction, args: Sequence) -> bytes:
     return encoded_args
 
 
+def decode_function_output(func: ContractFunction, data: bytes) -> Any:
+    """Decode raw return value of Solidity function using Contract proxy object.
+
+    Uses `web3.Contract.functions` prepared function as the ABI source.
+
+    :param func:
+        Function which arguments we are going to encode.
+
+        Must be bound.
+
+    :param result:
+        Raw encoded Solidity bytes.
+    """
+    assert isinstance(func, ContractFunction)
+
+    web3 = func.w3
+
+    fn_abi, fn_selector, aligned_fn_arguments = get_function_info(
+        func.fn_name,
+        web3.codec,
+        func.contract_abi,
+        args=func.args,
+    )
+    arg_types = [t["type"] for t in fn_abi["outputs"]]
+    decoded_out = eth_abi.decode(arg_types, data)
+    return decoded_out
+
+
 def encode_function_call(
     func: ContractFunction,
     args: Sequence,
@@ -320,7 +357,10 @@ def encode_function_call(
         fn_abi,
         args,
     )
-    encoded = encode_abi(w3, fn_abi, fn_arguments, fn_selector)
+    try:
+        encoded = encode_abi(w3, fn_abi, fn_arguments, fn_selector)
+    except Exception as e:
+        raise RuntimeError(f"Could not encode ABI: {fn_abi}, args: {fn_arguments}") from e
     return HexBytes(encoded)
 
 
@@ -464,3 +504,41 @@ def get_function_selector(func: ContractFunction) -> bytes:
     function_signature = _abi_to_signature(fn_abi)
     fn_selector = function_signature_to_4byte_selector(function_signature)  # type: ignore
     return fn_selector
+
+
+def _hexify(s: Any):
+    if type(s) in (list, tuple):
+        return str([_hexify(x) for x in s])
+    if isinstance(s, str):
+        return s
+    elif isinstance(s, bytes):
+        return "0x" + s.hex()
+    return str(s)
+
+
+def present_solidity_args(a: list | tuple | Any) -> str:
+    """Try make Solidity call args human readable.
+
+    Make sure we display bytes as hex.
+
+    Example:
+
+    .. code-block:: python
+
+        contract_address = func_call.address
+        data_payload = encode_function_call(func_call, func_call.arguments)
+        logger.info(
+            "Lagoon: Wrapping call to TradingStrategyModuleV0. Target: %s, function: %s (0x%s), args: %s, payload is %d bytes",
+            contract_address,
+            func_call.fn_name,
+            get_function_selector(func_call).hex(),
+            present_solidity_args(func_call.arguments),
+            len(data_payload),
+        )
+
+    Output::
+
+        Lagoon: Wrapping call to TradingStrategyModuleV0. Target: 0x5788F91Aa320e0610122fb88B39Ab8f35e50040b, function: exactInput (c04b8d59), args: ["['0x833589fcd6edb6e08f4c7c32d4f71b54bda029130001f442000000000000000000000000000000000000060027106921b130d297cc43754afba22e5eac0fbf8db75b', '0xEBee4d3fE83DD4755761C65b772f6a4f900A118b', '9223372036854775808', '10000000', '25455184317467649376256']"], payload is 324 bytes
+
+    """
+    return _hexify(a)
