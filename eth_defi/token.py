@@ -8,10 +8,17 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import cached_property
-from typing import Optional, Union
+from typing import Optional, Union, TypeAlias
+import warnings
 
 import cachetools
-from eth_tester.exceptions import TransactionFailed
+from web3.contract.contract import ContractFunction
+
+with warnings.catch_warnings():
+    # DeprecationWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html
+    warnings.simplefilter("ignore")
+    from eth_tester.exceptions import TransactionFailed
+
 from eth_typing import HexAddress
 from web3 import Web3
 from web3.contract import Contract
@@ -26,11 +33,13 @@ from eth_defi.utils import sanitise_string
 #: `ValueError` is raised by Ganache
 _call_missing_exceptions = (TransactionFailed, BadFunctionCallOutput, ValueError, ContractLogicError)
 
-
 #: By default we cache 1024 token details using LRU.
 #:
 #:
 DEFAULT_TOKEN_CACHE = cachetools.LRUCache(1024)
+
+#: ERC-20 address, 0x prefixed string
+TokenAddress: TypeAlias = str
 
 
 @dataclass
@@ -84,10 +93,21 @@ class TokenDetails:
         """The EVM chain id where this token lives."""
         return self.contract.w3.eth.chain_id
 
-    @property
+    @cached_property
     def address(self) -> HexAddress:
-        """The address of this token."""
+        """The address of this token.
+
+        Always lowercase.
+        """
         return self.contract.address
+
+    @cached_property
+    def address_lower(self) -> HexAddress:
+        """The address of this token.
+
+        Always lowercase.
+        """
+        return self.contract.address.lower()
 
     def convert_to_decimals(self, raw_amount: int) -> Decimal:
         """Convert raw token units to decimals.
@@ -101,7 +121,7 @@ class TokenDetails:
             assert details.convert_to_decimals(1) == Decimal("0.0000000000000001")
 
         """
-        return Decimal(raw_amount) / Decimal(10**self.decimals)
+        return Decimal(raw_amount) / Decimal(10 ** self.decimals)
 
     def convert_to_raw(self, decimal_amount: Decimal) -> int:
         """Convert decimalised token amount to raw uint256.
@@ -115,7 +135,7 @@ class TokenDetails:
             assert details.convert_to_raw(1) == 1_000_000
 
         """
-        return int(decimal_amount * 10**self.decimals)
+        return int(decimal_amount * 10 ** self.decimals)
 
     def fetch_balance_of(self, address: HexAddress | str, block_identifier="latest") -> Decimal:
         """Get an address token balance.
@@ -126,8 +146,68 @@ class TokenDetails:
         :return:
             Converted to decimal using :py:meth:`convert_to_decimal`
         """
+        address = Web3.to_checksum_address(address)
         raw_amount = self.contract.functions.balanceOf(address).call(block_identifier=block_identifier)
         return self.convert_to_decimals(raw_amount)
+
+    def transfer(
+            self,
+            to: HexAddress | str,
+            amount: Decimal,
+    ) -> ContractFunction:
+        """Prepare a ERC20.transfer() transaction with human-readable amount.
+
+        Example:
+
+        .. code-block:: python
+
+            another_new_depositor = web3.eth.accounts[6]
+            tx_hash = base_usdc.transfer(another_new_depositor, Decimal(500)).transact({"from": usdc_holder, "gas": 100_000})
+            assert_transaction_success_with_explanation(web3, tx_hash)
+
+        :return:
+            Bound contract function you need to turn to a tx
+        """
+        assert isinstance(amount, Decimal), f"Give amounts in decimal, got {type(amount)}"
+        to = Web3.to_checksum_address(to)
+        raw_amount = self.convert_to_raw(amount)
+        return self.contract.functions.transfer(to, raw_amount)
+
+    def approve(
+            self,
+            to: HexAddress | str,
+            amount: Decimal,
+    ) -> ContractFunction:
+        """Prepare a ERC20.approve() transaction with human-readable amount.
+
+        Example:
+
+        .. code-block:: python
+
+            usdc_amount = Decimal(9.00)
+            tx_hash = usdc.approve(vault.address, usdc_amount).transact({"from": depositor})
+            assert_transaction_success_with_explanation(web3, tx_hash)
+
+        :return:
+            Bound contract function you need to turn to a tx
+        """
+        assert isinstance(amount, Decimal), f"Give amounts in decimal, got {type(amount)}"
+        to = Web3.to_checksum_address(to)
+        raw_amount = self.convert_to_raw(amount)
+        return self.contract.functions.approve(to, raw_amount)
+
+    def fetch_raw_balance_of(self, address: HexAddress | str, block_identifier="latest") -> Decimal:
+        """Get an address token balance.
+
+        :param block_identifier:
+            A specific block to query if doing archive node historical queries
+
+        :return:
+            Raw token amount.
+        """
+        address = Web3.to_checksum_address(address)
+        raw_amount = self.contract.functions.balanceOf(address).call(block_identifier=block_identifier)
+        return raw_amount
 
     @staticmethod
     def generate_cache_key(chain_id: int, address: str) -> int:
@@ -148,12 +228,12 @@ class TokenDetailError(Exception):
 
 
 def create_token(
-    web3: Web3,
-    deployer: str,
-    name: str,
-    symbol: str,
-    supply: int,
-    decimals: int = 18,
+        web3: Web3,
+        deployer: str,
+        name: str,
+        symbol: str,
+        supply: int,
+        decimals: int = 18,
 ) -> Contract:
     """Deploys a new ERC-20 token on local dev, testnet or mainnet.
 
@@ -197,14 +277,23 @@ def create_token(
     return deploy_contract(web3, "ERC20MockDecimals.json", deployer, name, symbol, supply, decimals)
 
 
+def get_erc20_contract(
+        web3: Web3,
+        address: HexAddress,
+        contract_name="ERC20MockDecimals.json",
+) -> Contract:
+    """Wrap address as ERC-20 standard interface."""
+    return get_deployed_contract(web3, contract_name, address)
+
+
 def fetch_erc20_details(
-    web3: Web3,
-    token_address: Union[HexAddress, str],
-    max_str_length: int = 256,
-    raise_on_error=True,
-    contract_name="ERC20MockDecimals.json",
-    cache: cachetools.Cache | None = DEFAULT_TOKEN_CACHE,
-    chain_id: int = None,
+        web3: Web3,
+        token_address: Union[HexAddress, str],
+        max_str_length: int = 256,
+        raise_on_error=True,
+        contract_name="ERC20MockDecimals.json",
+        cache: cachetools.Cache | None = DEFAULT_TOKEN_CACHE,
+        chain_id: int = None,
 ) -> TokenDetails:
     """Read token details from on-chain data.
 
@@ -212,6 +301,10 @@ def fetch_erc20_details(
     We apply some sanitazation for incoming data, like length checks and removal of null bytes.
 
     The function should not raise an exception as long as the underlying node connection does not fail.
+
+    .. note ::
+
+        Always give ``chain_id`` when possible. Otherwise the caching of data is inefficient.
 
     Example:
 
@@ -262,7 +355,7 @@ def fetch_erc20_details(
     if not chain_id:
         chain_id = web3.eth.chain_id
 
-    erc_20 = get_deployed_contract(web3, contract_name, token_address)
+    erc_20 = get_erc20_contract(web3, token_address, contract_name)
 
     key = TokenDetails.generate_cache_key(chain_id, token_address)
 
@@ -337,3 +430,44 @@ def reset_default_token_cache():
     DEFAULT_TOKEN_CACHE.__dict__["_LRUCache__order"] = OrderedDict()
     DEFAULT_TOKEN_CACHE.__dict__["_Cache__currsize"] = 0
     DEFAULT_TOKEN_CACHE.__dict__["_Cache__data"] = dict()
+
+
+def get_wrapped_native_token_address(chain_id: int):
+    address = WRAPPED_NATIVE_TOKEN.get(chain_id)
+    assert address, f"Chain id {chain_id} not found"
+    return address
+
+
+#: Addresses of wrapped native token (WETH9) of different chains
+WRAPPED_NATIVE_TOKEN: dict[int, HexAddress] = {
+    # Mainnet
+    1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+    # Base
+    8453: "0x4200000000000000000000000000000000000006",
+    # WBNB
+    56: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
+    # WAVAX
+    43114: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7",
+}
+
+#: Addresses of wrapped native token (WETH9) of different chains
+USDC_NATIVE_TOKEN: dict[int, HexAddress] = {
+    # Mainnet
+    1: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    # Base
+    8453: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    # Ava
+    43114: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",
+}
+
+
+#: Addresses USDT Tether of different chains
+USDT_NATIVE_TOKEN: dict[int, HexAddress] = {
+    # Mainnet
+    1: "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    # Binance Smart Chain
+    56: "0x55d398326f99059FF775485246999027B3197955",
+    # USDT.E
+    43114: "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E",
+
+}

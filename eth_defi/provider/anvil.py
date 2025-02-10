@@ -49,7 +49,7 @@ from eth_typing import HexAddress
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from web3 import HTTPProvider, Web3
 
-from eth_defi.utils import is_localhost_port_listening, shutdown_hard, find_free_port
+from eth_defi.utils import find_free_port, is_localhost_port_listening, shutdown_hard
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +110,9 @@ def _launch(cmd: str, **kwargs) -> tuple[psutil.Popen, list[str]]:
     final_cmd_str = " ".join(cmd_list)
     logger.info("Launching anvil: %s", final_cmd_str)
     out = DEVNULL if sys.platform == "win32" else PIPE
-    return psutil.Popen(cmd_list, stdin=DEVNULL, stdout=out, stderr=out), cmd_list
+    env = os.environ.copy()
+    env["RUST_BACKTRACE"] = "1"  # Get tracebacks from crashed anvil
+    return psutil.Popen(cmd_list, stdin=DEVNULL, stdout=out, stderr=out, env=env), cmd_list
 
 
 def make_anvil_custom_rpc_request(web3: Web3, method: str, args: Optional[list] = None) -> Any:
@@ -198,7 +200,7 @@ def launch_anvil(
     block_time=0,
     launch_wait_seconds=20.0,
     attempts=3,
-    hardfork="london",
+    hardfork: str | None = "cancun",
     gas_limit: Optional[int] = None,
     steps_tracing=False,
     test_request_timeout=3.0,
@@ -534,6 +536,12 @@ def is_anvil(web3: Web3) -> bool:
 
     See also :py:func:`launch_anvil`
 
+    .. warning::
+
+        This method will crash with Base mainnet sequencer:
+
+        ``requests.exceptions.HTTPError: 403 Client Error: Forbidden for url: https://mainnet-sequencer.base.org/``.
+
     :param web3:
         Web3 connection instance to check
 
@@ -542,6 +550,19 @@ def is_anvil(web3: Web3) -> bool:
     """
     # 'anvil/v0.2.0'
     return "anvil/" in web3.client_version
+
+
+def is_mainnet_fork(web3: Web3) -> bool:
+    """Have we forked mainnet for this test.
+
+    - Only relevant with :py:func:`is_anvil`
+
+    :return:
+        True if we think we are connected to a forked mainnet,
+        False if we think we are a standalone local dev chain.
+    """
+    # Heurestics
+    return web3.eth.block_number > 500_000
 
 
 # Backwards compatibility

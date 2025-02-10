@@ -23,10 +23,15 @@ API documentation
    aave_v2/index
    aave_v3/index
    one_delta/index
+   safe/index
+   vault/index
    enzyme/index
+   lagoon/index
+   velvet/index
    chainlink/index
    foundry/index
    etherscan/index
+   token_analysis/index
    event_reader/index
    price_oracle/index
    data_research/index

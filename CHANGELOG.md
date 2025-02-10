@@ -1,7 +1,48 @@
-# Current
+# 0.28.1
 
-- Add:dRPC ` x-drpc-provider-id` header support for troubleshooting issues with decentralised node providers
+- Expose `TokenSnifferError.status_code` attribute so clients can handle sniffer errors
+
+
+# 0.28
+
+- Add: Google Cloud HSM hardware wallet support in `eth_defi.gcloud_hsm_wallet`
+- Add Multicall3 support in `multicall_batcher` module
+- Add `SwapRouter02` support on Base for doing Uniswap v3 swaps
+- Add Uniswap V3 quoter for the valuation
+- Add `buy_tokens()` helper to buy multiple tokens once, automatically look up best routes
+- Fix: Base MEV protected broadcast failed
+- Add: Integrate `TradingStrategyModuleV0` module to Gnosis Safe-based protocols using Zodiac module. Mainly needed for Lagoon vaults, but can work for others: vanilla Safe, DAOs.
+- Change: Default to Anvil 0.3.0, Cancun EVM hardfork
+
+
+# 0.27
+
+- Add: Support for [Velvet Capital vaults](https://www.velvet.capital/)
+- Add: Support for [Lagoon vaults](https://lagoon.finance/)
+- Add: Support for Gnosis Safe [Lagoon vaults](https://safe.global/) via `safe-eth-py` library integration
+- Add: Vault abstraction framework to easily work with different onchain vaults. Abstract away vault interactions to its own encapsulating interface.
+- Add: `wait_and_broadcast_multiple_nodes_mev_blocker()` for [MEV Blocker](https://mevblocker.io) - because the tx
+  broadcast must be sequential
+- Add: `fetch_erc20_balances_multicall` and `fetch_erc20_balances_fallback` read multiple ERC-20 balances using Multicall library
+- Add: `QuoterV2` support for Uniswap v3 - needed to get Base prices
+- Change `launch_anvil()` to use latest hardfork by default instead of `london`
+- Various smaller bug fixes and optimisations
+
+# 0.26.1 
+
+- Add: TokenSniffer API wrapper with a persistent cache
+- Add: Enzyme vault deployments on Arbitrum
+- Add: Custom cache interface support for `CachedTokenSniffer()`
+
+# 0.26
+
+- Add: dRPC `x-drpc-provider-id` header support for troubleshooting issues with decentralised node providers
 - Fixed: Whitelist HTTP 403 Forbidden for dRPC as a retryable error
+- Add: `wait_and_broadcast_multiple_nodes(inter_node_delay)` to fix Alchemy https://github.com/ethereum/go-ethereum/issues/26890
+- Internal change: Move `deploy_guard()` to its own function and refactor Enzyme vault deployment to more manageable
+- Dependencies: Numpy < 2.x for now as it breaks too much stuff, updating dependencies is a headache
+- Add and fixed: Various logging and diagnostics lines 
+- Fixed: [Uniswap Subgraphs now require an API key](https://github.com/tradingstrategy-ai/web3-ethereum-defi/pull/215)
 
 # 0.25.7
 

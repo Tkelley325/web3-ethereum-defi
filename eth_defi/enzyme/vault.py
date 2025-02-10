@@ -6,10 +6,11 @@ from decimal import Decimal
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Collection, Optional
+import logging
 
 from web3.exceptions import ContractLogicError
 
-from eth_defi.abi import get_deployed_contract
+from eth_defi.abi import get_deployed_contract, ZERO_ADDRESS
 from eth_typing import HexAddress
 from web3 import Web3
 from web3.contract import Contract
@@ -20,8 +21,8 @@ from eth_defi.event_reader.filter import Filter
 from eth_defi.event_reader.reader import Web3EventReader
 from eth_defi.hotwallet import HotWallet
 from eth_defi.token import TokenDetails, fetch_erc20_details
-from eth_defi.uniswap_v2.utils import ZERO_ADDRESS
 
+logger = logging.getLogger(__name__)
 
 # Cannot be slots because of cached property
 # @dataclass(slots=True)
@@ -359,11 +360,15 @@ class Vault:
         payment_forwarder: str | HexAddress | None = None,
         deployed_at_block: int | None = None,
         asset_manager: HexAddress | None = None,
+        extra_addresses: dict[str, str] | None = None,
     ) -> "Vault":
         """Fetch Enzyme vault and deployment information based only on the vault address.
 
         Because vault does not have a way to cross-reference its contracts,
         we are now manually passing around a bunch of contracts and addresses.
+
+        :param extra_addresses:
+            Enzyme contract addresses we have deployed and we must pass along.
 
         :return:
             Enzyme vault instance with all the information populated in
@@ -376,7 +381,20 @@ class Vault:
         comptroller_address = vault_contract.functions.getAccessor().call()
         comptroller_contract = get_deployed_contract(web3, f"enzyme/{contract_name}.json", comptroller_address)
 
-        deployment = EnzymeDeployment.fetch_deployment(web3, {"comptroller_lib": comptroller_address})
+        if not extra_addresses:
+            extra_addresses = {}
+
+        extra_addresses.update(
+            {
+                "comptroller_lib": comptroller_address,
+                "generic_adapter": generic_adapter_address,
+            }
+        )
+
+        deployment = EnzymeDeployment.fetch_deployment(
+            web3,
+            contract_addresses=extra_addresses,
+        )
 
         if generic_adapter_address is not None:
             try:
@@ -427,3 +445,6 @@ class Vault:
             nominated_owner=nominated_owner,
             asset_manager=asset_manager,  # We cannot read asset manager back from the vault because it's just EVM hash map
         )
+
+
+

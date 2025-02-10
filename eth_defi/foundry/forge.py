@@ -16,6 +16,7 @@ from subprocess import DEVNULL, PIPE
 from typing import Tuple
 
 import psutil
+from eth_account.signers.local import LocalAccount
 from eth_typing import ChecksumAddress, HexAddress, HexStr
 from hexbytes import HexBytes
 from web3 import Web3
@@ -24,6 +25,7 @@ from web3.contract import Contract
 from eth_defi.abi import get_deployed_contract
 from eth_defi.deploy import register_contract
 from eth_defi.hotwallet import HotWallet
+from eth_defi.provider.anvil import is_anvil
 from eth_defi.trace import assert_transaction_success_with_explanation
 
 
@@ -48,6 +50,7 @@ def _exec_cmd(
     cmd_line: list[str],
     censored_command: str,
     timeout=DEFAULT_TIMEOUT,
+    verbose: bool = False,
 ) -> Tuple[str, str]:
     """Execute the command line.
 
@@ -69,7 +72,8 @@ def _exec_cmd(
     output = proc.stdout.read().decode("utf-8") + proc.stderr.read().decode("utf-8")
 
     if result != 0:
-        raise ForgeFailed(f"forge return code {result} when running: {censored_command}\nOutput is:\n{output}")
+        if "No files changed, compilation skipped" not in output:
+            raise ForgeFailed(f"forge return code {result} when running: {censored_command}\nOutput is:\n{output}")
 
     logger.debug("forge result:\n%s", output)
 
@@ -84,7 +88,7 @@ def _exec_cmd(
             tx_hash = line.split(":")[1].strip()
 
     if not (address and tx_hash):
-        raise ForgeFailed(f"Could not parse forge output:\n{output}")
+        raise ForgeFailed(f"Could not parse forge output:\n{output}\nCommand line was:{' '.join(cmd_line)}")
 
     return address, tx_hash
 
@@ -94,12 +98,15 @@ def deploy_contract_with_forge(
     project_folder: Path,
     contract_file: Path | str,
     contract_name: str,
-    deployer: HotWallet,
+    deployer: HotWallet | LocalAccount,
     constructor_args: list[str] | None = None,
     etherscan_api_key: str | None = None,
     register_for_tracing=True,
     timeout=DEFAULT_TIMEOUT,
     wait_for_block_confirmations=0,
+    verify_delay=20,
+    verify_retries=9,
+    verbose=False,
 ) -> Tuple[Contract, HexBytes]:
     """Deploy and verify smart contract with Forge.
 
@@ -175,6 +182,9 @@ def deploy_contract_with_forge(
     :param wait_for_block_confirmations:
         Currently not used.
 
+    :param verbose:
+        Try to be extra verbose with Forge output to pin point errors
+
     :raise ForgeFailed:
         In the case we could not deploy the contract.
 
@@ -187,7 +197,6 @@ def deploy_contract_with_forge(
     """
     assert isinstance(project_folder, Path)
     assert type(contract_name) == str
-    assert isinstance(deployer, HotWallet), f"Got deployer: {type(deployer)}"
 
     if constructor_args is None:
         constructor_args = []
@@ -205,27 +214,41 @@ def deploy_contract_with_forge(
 
     src_contract_file = Path("src") / contract_file
 
+    if isinstance(deployer, HotWallet):
+        private_key = deployer.private_key.hex()
+        nonce = str(deployer.allocate_nonce())
+    elif isinstance(deployer, LocalAccount):
+        private_key = deployer._private_key.hex()
+        nonce = str(web3.eth.get_transaction_count(deployer.address))
+    else:
+        raise NotImplementedError(f"Unsupported deployer: {deployer}")
+
     cmd_line = [
         forge,
         "create",
+        "--broadcast",
         "--rpc-url",
         json_rpc_url,
         "--nonce",
-        str(deployer.allocate_nonce()),
+        nonce,
     ]
 
     if etherscan_api_key:
-        # Tuned retry parameters
-        # https://github.com/foundry-rs/foundry/issues/6953
-        cmd_line += [
-            "--etherscan-api-key",
-            etherscan_api_key,
-            "--verify",
-            "--retries",
-            "10",
-            "--delay",
-            "30",
-        ]
+        if is_anvil(web3):
+            logger.warning("Etherscan verification skipped, running on a local fork")
+        else:
+            logger.info("Doing Etherscan verification with %d retries", verify_retries)
+            # Tuned retry parameters
+            # https://github.com/foundry-rs/foundry/issues/6953
+            cmd_line += [
+                "--etherscan-api-key",
+                etherscan_api_key,
+                "--verify",
+                "--retries",
+                str(verify_retries),
+                "--delay",
+                str(verify_delay),
+            ]
 
     cmd_line += [f"{src_contract_file}:{contract_name}"]
 
@@ -234,7 +257,11 @@ def deploy_contract_with_forge(
         for arg in constructor_args:
             cmd_line.append(arg)
 
-    censored_command = " ".join(cmd_line)
+    try:
+        censored_command = " ".join(cmd_line)
+    except TypeError as e:
+        # Be helpful with None error
+        raise TypeError(f"Could not splice command line: {cmd_line}") from e
 
     logger.info(
         "Deploying a contract with forge. Working directory %s, forge command: %s",
@@ -247,7 +274,7 @@ def deploy_contract_with_forge(
         forge,
         "create",
         "--private-key",
-        deployer.private_key.hex(),
+        private_key,
     ] + cmd_line[2:]
 
     # Py 3.11 only
@@ -262,7 +289,7 @@ def deploy_contract_with_forge(
         assert src_contract_file.exists(), f"Contract does not exist: {src_contract_file}, current working directory is {os.getcwd()}"
 
         # Run forge
-        contract_address, tx_hash = _exec_cmd(cmd_line, timeout=timeout, censored_command=censored_command)
+        contract_address, tx_hash = _exec_cmd(cmd_line, timeout=timeout, censored_command=censored_command, verbose=verbose)
 
         # Check we produced an ABI file, or was created earlier
         contract_abi = project_folder / "out" / contract_file / f"{contract_name}.json"
